@@ -12,6 +12,10 @@ module Vmpooler
       include Vmpooler::API::Helpers
     end
 
+    def tracer
+      @tracer ||= OpenTelemetry.tracer_provider.tracer('api_v1', Vmpooler::VERSION)
+    end
+
     def backend
       Vmpooler::API.settings.redis
     end
@@ -105,131 +109,149 @@ module Vmpooler
     end
 
     def fetch_single_vm(template)
-      template_backends = [template]
-      aliases = Vmpooler::API.settings.config[:alias]
-      if aliases
-        template_backends += aliases[template] if aliases[template].is_a?(Array)
-        template_backends << aliases[template] if aliases[template].is_a?(String)
-        pool_index = pool_index(pools)
-        weighted_pools = {}
-        template_backends.each do |t|
-          next unless pool_index.key? t
+      tracer.in_span("Vmpooler::API::V1.#{__method__}") do
+        template_backends = [template]
+        aliases = Vmpooler::API.settings.config[:alias]
+        if aliases
+          template_backends += aliases[template] if aliases[template].is_a?(Array)
+          template_backends << aliases[template] if aliases[template].is_a?(String)
+          pool_index = pool_index(pools)
+          weighted_pools = {}
+          template_backends.each do |t|
+            next unless pool_index.key? t
 
-          index = pool_index[t]
-          clone_target = pools[index]['clone_target'] || config['clone_target']
-          next unless config.key?('backend_weight')
+            index = pool_index[t]
+            clone_target = pools[index]['clone_target'] || config['clone_target']
+            next unless config.key?('backend_weight')
 
-          weight = config['backend_weight'][clone_target]
-          if weight
-            weighted_pools[t] = weight
-          end
-        end
-
-        if weighted_pools.count == template_backends.count
-          pickup = Pickup.new(weighted_pools)
-          selection = pickup.pick
-          template_backends.delete(selection)
-          template_backends.unshift(selection)
-        else
-          first = template_backends.sample
-          template_backends.delete(first)
-          template_backends.unshift(first)
-        end
-      end
-
-      checkoutlock.synchronize do
-        template_backends.each do |template_backend|
-          vms = backend.smembers("vmpooler__ready__#{template_backend}")
-          next if vms.empty?
-
-          vms.reverse.each do |vm|
-            ready = vm_ready?(vm, config['domain'])
-            if ready
-              smoved = backend.smove("vmpooler__ready__#{template_backend}", "vmpooler__running__#{template_backend}", vm)
-              if smoved
-                return [vm, template_backend, template]
-              else
-                metrics.increment("checkout.smove.failed.#{template_backend}")
-                return [nil, nil, nil]
-              end
-            else
-              backend.smove("vmpooler__ready__#{template_backend}", "vmpooler__completed__#{template_backend}", vm)
-              metrics.increment("checkout.nonresponsive.#{template_backend}")
+            weight = config['backend_weight'][clone_target]
+            if weight
+              weighted_pools[t] = weight
             end
           end
+
+          if weighted_pools.count == template_backends.count
+            pickup = Pickup.new(weighted_pools)
+            selection = pickup.pick
+            template_backends.delete(selection)
+            template_backends.unshift(selection)
+          else
+            first = template_backends.sample
+            template_backends.delete(first)
+            template_backends.unshift(first)
+          end
         end
-        [nil, nil, nil]
+
+        checkoutlock.synchronize do
+          template_backends.each do |template_backend|
+            vms = backend.smembers("vmpooler__ready__#{template_backend}")
+            next if vms.empty?
+
+            vms.reverse.each do |vm|
+              ready = vm_ready?(vm, config['domain'])
+              if ready
+                smoved = backend.smove("vmpooler__ready__#{template_backend}", "vmpooler__running__#{template_backend}", vm)
+                if smoved
+                  return [vm, template_backend, template]
+                else
+                  metrics.increment("checkout.smove.failed.#{template_backend}")
+                  return [nil, nil, nil]
+                end
+              else
+                backend.smove("vmpooler__ready__#{template_backend}", "vmpooler__completed__#{template_backend}", vm)
+                metrics.increment("checkout.nonresponsive.#{template_backend}")
+              end
+            end
+          end
+          [nil, nil, nil]
+        end
       end
     end
 
     def return_vm_to_ready_state(template, vm)
-      backend.smove("vmpooler__running__#{template}", "vmpooler__ready__#{template}", vm)
+      tracer.in_span("Vmpooler::API::V1.#{__method__}") do
+        backend.smove("vmpooler__running__#{template}", "vmpooler__ready__#{template}", vm)
+      end
     end
 
     def account_for_starting_vm(template, vm)
-      backend.sadd("vmpooler__migrating__#{template}", vm)
-      backend.hset("vmpooler__active__#{template}", vm, Time.now)
-      backend.hset("vmpooler__vm__#{vm}", 'checkout', Time.now)
+      tracer.in_span("Vmpooler::API::V1.#{__method__}") do
+        backend.sadd("vmpooler__migrating__#{template}", vm)
+        backend.hset("vmpooler__active__#{template}", vm, Time.now)
+        backend.hset("vmpooler__vm__#{vm}", 'checkout', Time.now)
 
-      if Vmpooler::API.settings.config[:auth] and has_token?
-        validate_token(backend)
+        if Vmpooler::API.settings.config[:auth] and has_token?
+          validate_token(backend)
 
-        backend.hset('vmpooler__vm__' + vm, 'token:token', request.env['HTTP_X_AUTH_TOKEN'])
-        backend.hset('vmpooler__vm__' + vm, 'token:user',
-                     backend.hget('vmpooler__token__' + request.env['HTTP_X_AUTH_TOKEN'], 'user')
-        )
+          backend.hset('vmpooler__vm__' + vm, 'token:token', request.env['HTTP_X_AUTH_TOKEN'])
+          backend.hset('vmpooler__vm__' + vm, 'token:user',
+                       backend.hget('vmpooler__token__' + request.env['HTTP_X_AUTH_TOKEN'], 'user')
+          )
 
-        if config['vm_lifetime_auth'].to_i > 0
-          backend.hset('vmpooler__vm__' + vm, 'lifetime', config['vm_lifetime_auth'].to_i)
+          if config['vm_lifetime_auth'].to_i > 0
+            backend.hset('vmpooler__vm__' + vm, 'lifetime', config['vm_lifetime_auth'].to_i)
+          end
         end
       end
     end
 
     def update_result_hosts(result, template, vm)
-      result[template] ||= {}
-      if result[template]['hostname']
-        result[template]['hostname'] = Array(result[template]['hostname'])
-        result[template]['hostname'].push(vm)
-      else
-        result[template]['hostname'] = vm
+      tracer.in_span("Vmpooler::API::V1.#{__method__}") do
+        result[template] ||= {}
+        if result[template]['hostname']
+          result[template]['hostname'] = Array(result[template]['hostname'])
+          result[template]['hostname'].push(vm)
+        else
+          result[template]['hostname'] = vm
+        end
       end
     end
 
     def atomically_allocate_vms(payload)
-      result = { 'ok' => false }
-      failed = false
-      vms = []
+      tracer.in_span("Vmpooler::API::V1.#{__method__}") do |span|
+        result = { 'ok' => false }
+        failed = false
+        vms = []
 
-      payload.each do |requested, count|
-        count.to_i.times do |_i|
-          vmname, vmpool, vmtemplate = fetch_single_vm(requested)
-          if !vmname
-            failed = true
-            metrics.increment('checkout.empty.' + requested)
-            break
-          else
-            vms << [vmpool, vmname, vmtemplate]
-            metrics.increment('checkout.success.' + vmtemplate)
+        payload.each do |requested, count|
+          count.to_i.times do |_i|
+            vmname, vmpool, vmtemplate = fetch_single_vm(requested)
+            if !vmname
+              failed = true
+              metrics.increment('checkout.empty.' + requested)
+              break
+            else
+              vms << [vmpool, vmname, vmtemplate]
+              metrics.increment('checkout.success.' + vmtemplate)
+            end
           end
         end
-      end
 
-      if failed
-        vms.each do |(vmpool, vmname, _vmtemplate)|
-          return_vm_to_ready_state(vmpool, vmname)
+        if failed
+          vms.each do |(vmpool, vmname, _vmtemplate)|
+            return_vm_to_ready_state(vmpool, vmname)
+          end
+          span.add_event('error', attributes: {
+            'error.type' => 'Vmpooler::API::V1.atomically_allocate_vms',
+            'error.message' => '503 due to failing to allocate one or more vms'
+          })
+          status 503
+        else
+          vm_names = []
+          vms.each do |(vmpool, vmname, vmtemplate)|
+            account_for_starting_vm(vmpool, vmname)
+            update_result_hosts(result, vmtemplate, vmname)
+            vm_names.append(vmname)
+          end
+
+          span.set_attribute('vmpooler.vm_names', vm_names.join(',')) unless vm_names.empty?
+
+          result['ok'] = true
+          result['domain'] = config['domain'] if config['domain']
         end
-        status 503
-      else
-        vms.each do |(vmpool, vmname, vmtemplate)|
-          account_for_starting_vm(vmpool, vmname)
-          update_result_hosts(result, vmtemplate, vmname)
-        end
 
-        result['ok'] = true
-        result['domain'] = config['domain'] if config['domain']
+        result
       end
-
-      result
     end
 
     def update_pool_size(payload)
